@@ -88,11 +88,16 @@ def main():
     labels.extend([0] * len(benign))
     families.extend(["benign"] * len(benign))
 
+    print("Building DataFrame...")
     df = pd.DataFrame({"domain": domains, "label": labels, "family": families})
+    
+    print("Shuffling DataFrame... (This takes a lot of memory!)")
     df = df.sample(frac=1, random_state=42).reset_index(drop=True)
-
+    
+    print("Saving to Parquet...")
     DGA_DATASET_PATH.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(DGA_DATASET_PATH)
+    
     print(f"\nSaved {len(df):,} rows to {DGA_DATASET_PATH}")
     print(df["family"].value_counts())
 
