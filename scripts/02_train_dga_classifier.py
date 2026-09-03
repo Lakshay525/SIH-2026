@@ -17,7 +17,14 @@ def main():
     print(f"Loaded {len(df):,} domains, {df['family'].nunique()} labels (incl benign)")
 
     t0 = time.time()
-    feats = df["domain"].apply(lexical_features).apply(pd.Series)
+    from tqdm import tqdm
+    tqdm.pandas()
+
+    # Extract features into a raw list first (with progress bar)
+    raw_feats = df["domain"].progress_apply(lexical_features).tolist()
+    
+    # Convert the list to a DataFrame all at once (100x faster than pd.Series)
+    feats = pd.DataFrame(raw_feats)
     df = pd.concat([df.reset_index(drop=True), feats.reset_index(drop=True)], axis=1)
     print(f"Feature extraction: {time.time()-t0:.1f}s")
 
