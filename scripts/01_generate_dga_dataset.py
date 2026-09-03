@@ -21,7 +21,7 @@ from config import DGA_DATASET_PATH
 RAW_DIR = r"E:\Code\SIH2026\dataset\DGA"                              # <-- DGArchive CSVs
 FILENAME_PATTERN = "*_dga.csv"
 DOMAIN_COLUMN = "domain"
-BENIGN_FILE = r"E:\Code\SIH2026\dataset\Benign domains\top-1m.csv"    # <-- Tranco file
+BENIGN_FILE = r"E:\Code\SIH2026\SIH-2026\data\benign_domains.txt"    # <-- New merged file   
 
 MAX_PER_FAMILY = 5000   # cap huge families so none dominates training
 random.seed(42)
@@ -71,7 +71,7 @@ def load_real_benign(n: int, path: str = BENIGN_FILE) -> list[str] | None:
         print("[benign] Download a real list, e.g. Tranco: https://tranco-list.eu/")
         return None
 
-    df = pd.read_csv(p, header=None, names=["rank", "domain"], dtype=str)
+    df = pd.read_csv(p, header=None, names=["domain"], dtype=str)
     all_domains = df["domain"].str.strip().str.lower().dropna().unique().tolist()
     print(f"[benign] Loaded {len(all_domains):,} real domains from {path}")
 
