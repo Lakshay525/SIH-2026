@@ -25,12 +25,20 @@ def check_domain(dga_model, domain):
     return None
 
 def check_ip_window(tunnel_model, ip, stats):
+    # --- ADD THESE 3 LINES ---
+    # Ensure any columns the model expects but the simulation missed are set to 0
+    for col in TUNNEL_COLS:
+        if col not in stats:
+            stats[col] = 0.0
+    # -------------------------
+
     row = pd.DataFrame([stats])[TUNNEL_COLS]
     score = -tunnel_model.decision_function(row)[0]
     flagged = tunnel_model.predict(row)[0] == -1
+    
     if flagged:
         return make_alert(flow_id=ip, threat_class="DNS_TUNNELLING",
-                           confidence=min(score, 1.0), evidence=stats)
+                          confidence=min(score, 1.0), evidence=stats)
     return None
 
 def main():
