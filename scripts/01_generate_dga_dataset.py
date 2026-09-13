@@ -16,12 +16,12 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from config import DGA_DATASET_PATH
+from config import DGA_DATASET_PATH, DGA_RAW_DIR, BENIGN_DOMAINS_PATH
 
-RAW_DIR = r"E:\Code\SIH2026\dataset\DGA"                              # <-- DGArchive CSVs
+RAW_DIR = str(DGA_RAW_DIR)              # <-- DGArchive CSVs, set in config.py
 FILENAME_PATTERN = "*_dga.csv"
 DOMAIN_COLUMN = "domain"
-BENIGN_FILE = r"E:\Code\SIH2026\SIH-2026\data\benign_domains.txt"    # <-- New merged file   
+BENIGN_FILE = str(BENIGN_DOMAINS_PATH)  # <-- merged benign domain list, set in config.py
 
 MAX_PER_FAMILY = 5000   # cap huge families so none dominates training
 random.seed(42)

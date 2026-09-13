@@ -17,3 +17,7 @@ TUNNEL_DATASET_PATH = DATA_DIR / "tunnelling_windows.parquet"
 
 WORDLIST_PATH = DATA_DIR / "english_words.txt"   # any 1-word-per-line dict file
 MODEL_DIR = DATA_DIR / "models"
+
+# Raw inputs consumed by scripts/01_generate_dga_dataset.py
+DGA_RAW_DIR = Path(r"E:\Code\SIH2026\dataset\DGA")       # <-- per-family DGArchive CSVs
+BENIGN_DOMAINS_PATH = DATA_DIR / "benign_domains.txt"    # <-- merged benign domain list

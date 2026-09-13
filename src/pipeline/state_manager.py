@@ -11,23 +11,26 @@ BUCKET_SECONDS = 5
 PROMOTE_THRESHOLD = 40  # unique-subdomain count above which we switch to a sketch
 
 class IPState:
-    __slots__ = ("bucket_count", "bucket_sumlen", "bucket_txt",
+    __slots__ = ("bucket_count", "bucket_sumlen", "bucket_txt", "bucket_nxdomain",
                  "domain_set", "hll", "promoted")
 
     def __init__(self):
         self.bucket_count = [0] * N_BUCKETS
         self.bucket_sumlen = [0] * N_BUCKETS
         self.bucket_txt = [0] * N_BUCKETS
+        self.bucket_nxdomain = [0] * N_BUCKETS
         self.domain_set = set()
         self.hll = None
         self.promoted = False
 
-    def add(self, bucket_idx, domain, qtype, length):
+    def add(self, bucket_idx, domain, qtype, length, nxdomain=False):
         b = bucket_idx % N_BUCKETS
         self.bucket_count[b] += 1
         self.bucket_sumlen[b] += length
         if qtype == "TXT":
             self.bucket_txt[b] += 1
+        if nxdomain:
+            self.bucket_nxdomain[b] += 1
 
         if not self.promoted:
             self.domain_set.add(domain)
@@ -45,6 +48,7 @@ class IPState:
         self.bucket_count[b] = 0
         self.bucket_sumlen[b] = 0
         self.bucket_txt[b] = 0
+        self.bucket_nxdomain[b] = 0
 
     def unique_estimate(self):
         return self.hll.count() if self.promoted else len(self.domain_set)
@@ -53,9 +57,11 @@ class IPState:
         count = sum(self.bucket_count)
         sum_len = sum(self.bucket_sumlen)
         txt = sum(self.bucket_txt)
+        nxdomain = sum(self.bucket_nxdomain)
         return {
             "query_rate": count,
             "avg_query_len": sum_len / count if count else 0,
             "txt_ratio": txt / count if count else 0,
+            "nxdomain_rate": nxdomain / count if count else 0,
             "unique_subdomains": self.unique_estimate(),
         }

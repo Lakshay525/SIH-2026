@@ -25,13 +25,6 @@ def check_domain(dga_model, domain):
     return None
 
 def check_ip_window(tunnel_model, ip, stats):
-    # --- ADD THESE 3 LINES ---
-    # Ensure any columns the model expects but the simulation missed are set to 0
-    for col in TUNNEL_COLS:
-        if col not in stats:
-            stats[col] = 0.0
-    # -------------------------
-
     row = pd.DataFrame([stats])[TUNNEL_COLS]
     score = -tunnel_model.decision_function(row)[0]
     flagged = tunnel_model.predict(row)[0] == -1
@@ -53,7 +46,9 @@ def main():
     # -- Simulated live DNS stream for one source IP --
     state = IPState()
     for i in range(45):
-        state.add(bucket_idx=0, domain=f"{i}-exfil.example.com", qtype="TXT", length=55)
+        # Exfil-style lookups typically resolve to attacker-controlled nonexistent
+        # names, so mark them NXDOMAIN -- this is what feeds nxdomain_rate below.
+        state.add(bucket_idx=0, domain=f"{i}-exfil.example.com", qtype="TXT", length=55, nxdomain=True)
     alert = check_ip_window(tunnel_model, "203.0.113.7", state.stats())
     print(f"\n[TUNNEL] 203.0.113.7: {'ALERT ' + str(alert) if alert else 'clean'}")
 
