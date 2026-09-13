@@ -92,8 +92,29 @@ def hex_char_ratio(s: str) -> float:
     hex_chars = set("0123456789abcdef")
     return sum(c in hex_chars for c in s.lower()) / max(len(s), 1)
 
+def extract_label(domain: str) -> str:
+    """
+    Pick the label that actually carries DGA signal out of a possibly
+    multi-level FQDN.
+
+    DGA training data (DGArchive) is virtually always a bare `random.tld`
+    (2 labels), so grabbing the label just before the TLD is a no-op there.
+    Real passively-observed traffic, though, routinely carries a CDN/tracking
+    subdomain as the *leftmost* label (e.g. "a1b2c3d4.cdn.example.com") --
+    that label alone can look high-entropy/DGA-like by pure chance even
+    though the query is completely benign. Using the second-to-last label
+    instead of the first avoids that whole class of false positive.
+
+    This is a heuristic, not full public-suffix-list-aware eTLD+1 extraction
+    (see PSL/`tldextract`), so multi-part TLDs like "co.uk"/"com.au" are a
+    known edge case -- documented in README.md's Limitations section.
+    """
+    parts = domain.rstrip(".").split(".")
+    return parts[-2] if len(parts) >= 2 else parts[0]
+
+
 def lexical_features(domain: str) -> dict:
-    name = domain.split(".")[0]
+    name = extract_label(domain)
     return {
         "length": len(name),
         "entropy": shannon_entropy(name),

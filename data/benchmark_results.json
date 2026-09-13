@@ -1,0 +1,13 @@
+{
+  "n_events": 50000,
+  "n_distinct_ips": 2000,
+  "max_ips_configured": 500,
+  "wall_seconds": 150.81281879998278,
+  "events_per_second": 331.5368043502527,
+  "latency_ms_mean": 3.0152426960365846,
+  "latency_ms_p50": 2.928100060671568,
+  "latency_ms_p95": 3.565699909813702,
+  "latency_ms_p99": 3.887500031851232,
+  "active_ips_after_run": 500,
+  "evicted_total": 49500
+}

@@ -1,0 +1,47 @@
+{
+  "n_windows": 539,
+  "overall_report": {
+    "0": {
+      "precision": 1.0,
+      "recall": 0.09615384615384616,
+      "f1-score": 0.17543859649122806,
+      "support": 416.0
+    },
+    "1": {
+      "precision": 0.24649298597194388,
+      "recall": 1.0,
+      "f1-score": 0.3954983922829582,
+      "support": 123.0
+    },
+    "accuracy": 0.30241187384044527,
+    "macro avg": {
+      "precision": 0.6232464929859719,
+      "recall": 0.5480769230769231,
+      "f1-score": 0.2854684943870931,
+      "support": 539.0
+    },
+    "weighted avg": {
+      "precision": 0.8280494198043582,
+      "recall": 0.30241187384044527,
+      "f1-score": 0.2256563235457416,
+      "support": 539.0
+    }
+  },
+  "confusion_matrix": [
+    [
+      40,
+      376
+    ],
+    [
+      0,
+      123
+    ]
+  ],
+  "per_tool_recall": {
+    "dns2tcp": 1.0,
+    "dnscapy": 1.0,
+    "iodine": 1.0,
+    "tuns": 1.0
+  },
+  "note": "txt_ratio is 0.0 for real iodine/tuns sessions in this dataset (they use NULL/CNAME, not TXT) -- detection for those tools, if it works, is being driven by avg_query_len, not txt_ratio. nxdomain_rate is fixed at 0.0 for all real-derived sessions (not derivable from this dataset -- see scripts/03b docstring)."
+}
