@@ -111,6 +111,10 @@ def test_pipeline_modules_do_not_import_networking_libraries():
         # would be tempted to wire to a remote API or to `tldextract`, which
         # fetches the Public Suffix List over the network on first use.
         Path(__file__).resolve().parent.parent / "src" / "features" / "reputation.py",
+        # Same reasoning as reputation.py, more acutely: this is the module
+        # that literally reimplements what tldextract does, so it's the most
+        # natural place for a future edit to "simplify" by importing it.
+        Path(__file__).resolve().parent.parent / "src" / "features" / "public_suffix.py",
         Path(__file__).resolve().parent.parent / "src" / "pipeline" / "state_manager.py",
         Path(__file__).resolve().parent.parent / "src" / "pipeline" / "engine.py",
         Path(__file__).resolve().parent.parent / "src" / "pipeline" / "alert_schema.py",

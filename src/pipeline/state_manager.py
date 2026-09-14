@@ -25,7 +25,8 @@ Two layers of bounding:
      than wall-clock so replays are reproducible) keep total memory bounded
      regardless of stream length or IP fan-out.
 """
-from collections import OrderedDict
+import math
+from collections import Counter, OrderedDict
 from datasketch import HyperLogLog
 
 N_BUCKETS = 12          # 12 x 5-second buckets = 60-second sliding window
@@ -47,13 +48,13 @@ def bucket_index(ts: float) -> int:
 
 
 class IPState:
-    __slots__ = ("bucket_count", "bucket_sumlen", "bucket_txt", "bucket_nxdomain",
+    __slots__ = ("bucket_count", "bucket_sumlen", "bucket_qtypes", "bucket_nxdomain",
                  "bucket_epoch", "bucket_domains", "bucket_hll")
 
     def __init__(self):
         self.bucket_count = [0] * N_BUCKETS
         self.bucket_sumlen = [0] * N_BUCKETS
-        self.bucket_txt = [0] * N_BUCKETS
+        self.bucket_qtypes = [Counter() for _ in range(N_BUCKETS)]
         self.bucket_nxdomain = [0] * N_BUCKETS
         self.bucket_epoch = [-1] * N_BUCKETS   # global bucket_idx last written to each slot
         self.bucket_domains = [set() for _ in range(N_BUCKETS)]
@@ -64,7 +65,7 @@ class IPState:
         if self.bucket_epoch[b] != bucket_idx:
             self.bucket_count[b] = 0
             self.bucket_sumlen[b] = 0
-            self.bucket_txt[b] = 0
+            self.bucket_qtypes[b] = Counter()
             self.bucket_nxdomain[b] = 0
             self.bucket_domains[b] = set()
             self.bucket_hll[b] = None
@@ -75,8 +76,7 @@ class IPState:
         b = self._slot(bucket_idx)
         self.bucket_count[b] += 1
         self.bucket_sumlen[b] += length
-        if qtype == "TXT":
-            self.bucket_txt[b] += 1
+        self.bucket_qtypes[b][qtype] += 1
         if nxdomain:
             self.bucket_nxdomain[b] += 1
 
@@ -97,7 +97,7 @@ class IPState:
         b = bucket_idx % N_BUCKETS
         self.bucket_count[b] = 0
         self.bucket_sumlen[b] = 0
-        self.bucket_txt[b] = 0
+        self.bucket_qtypes[b] = Counter()
         self.bucket_nxdomain[b] = 0
         self.bucket_domains[b] = set()
         self.bucket_hll[b] = None
@@ -145,13 +145,38 @@ class IPState:
 
         count = sum(self.bucket_count[b] for b in live)
         sum_len = sum(self.bucket_sumlen[b] for b in live)
-        txt = sum(self.bucket_txt[b] for b in live)
         nxdomain = sum(self.bucket_nxdomain[b] for b in live)
+
+        qtypes = Counter()
+        for b in live:
+            qtypes.update(self.bucket_qtypes[b])
+        txt = qtypes.get("TXT", 0)
+        non_a = count - qtypes.get("A", 0)
+
+        # Empirically grounded, not guessed: scoring the real Mendeley
+        # tunnel-tool dataset (scripts/03b) showed non_a_ratio is 1.00 for
+        # ALL FOUR real tunnelling tools vs 0.00 for real normal traffic --
+        # a much stronger signal than txt_ratio alone, which is 0.0 for real
+        # iodine/tuns traffic (they use NULL/CNAME, not TXT). record_type_
+        # entropy is the weaker of the two on real data: 3 of 4 real tools
+        # commit to a single non-A record type per session (entropy ~0, same
+        # as normal traffic), so it mainly helps against tools that rotate
+        # record types (only dnscapy did, at ~1.0 bit) -- kept because it's
+        # a real, if narrower, signal, not because it dominates.
+        entropy = 0.0
+        if count:
+            for n in qtypes.values():
+                p = n / count
+                if p:
+                    entropy -= p * math.log2(p)
+
         return {
             "query_rate": count,
             "avg_query_len": sum_len / count if count else 0,
             "txt_ratio": txt / count if count else 0,
             "nxdomain_rate": nxdomain / count if count else 0,
+            "non_a_ratio": non_a / count if count else 0,
+            "record_type_entropy": entropy,
             "unique_subdomains": self.unique_estimate(live),
         }
 

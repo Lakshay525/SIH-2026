@@ -17,6 +17,7 @@ import streamlit as st
 from config import DATA_DIR, MODEL_DIR
 from src.pipeline.state_manager import IPStateManager
 from src.pipeline.engine import process_event, AlertDeduper
+from src.pipeline.event_schema import validate_event, InvalidEvent
 
 DEMO_STREAM_PATH = DATA_DIR / "demo_stream.jsonl"
 BENCHMARK_PATH = DATA_DIR / "benchmark_results.json"
@@ -41,8 +42,19 @@ def load_models():
 def load_events():
     if not DEMO_STREAM_PATH.exists():
         return []
+    events, rejected = [], 0
     with open(DEMO_STREAM_PATH, encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(validate_event(json.loads(line)))
+            except (json.JSONDecodeError, InvalidEvent):
+                rejected += 1
+    if rejected:
+        st.warning(f"{rejected} malformed event(s) in {DEMO_STREAM_PATH.name} were skipped.")
+    return events
 
 
 @st.cache_resource

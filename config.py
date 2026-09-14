@@ -18,6 +18,11 @@ TUNNEL_DATASET_PATH = DATA_DIR / "tunnelling_windows.parquet"
 WORDLIST_PATH = DATA_DIR / "english_words.txt"   # any 1-word-per-line dict file
 MODEL_DIR = DATA_DIR / "models"
 
+# Vendored snapshot of https://publicsuffix.org/list/public_suffix_list.dat
+# (MPL-2.0). See src/features/public_suffix.py for why this is a static file
+# and not a live-fetching library.
+PUBLIC_SUFFIX_LIST_PATH = DATA_DIR / "public_suffix_list.dat"
+
 # Raw inputs consumed by scripts/01_generate_dga_dataset.py
 DGA_RAW_DIR = Path(r"E:\Code\SIH2026\dataset\DGA")       # <-- per-family DGArchive CSVs
 BENIGN_DOMAINS_PATH = DATA_DIR / "benign_domains.txt"    # <-- merged benign domain list

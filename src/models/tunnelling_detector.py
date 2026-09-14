@@ -2,7 +2,8 @@
 import numpy as np
 from sklearn.ensemble import IsolationForest
 
-FEATURE_COLS = ["query_rate", "unique_subdomains", "avg_query_len", "txt_ratio", "nxdomain_rate"]
+FEATURE_COLS = ["query_rate", "unique_subdomains", "avg_query_len", "txt_ratio", "nxdomain_rate",
+                 "non_a_ratio", "record_type_entropy"]
 
 
 def as_matrix(windows):

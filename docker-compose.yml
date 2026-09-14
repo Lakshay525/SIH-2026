@@ -1,0 +1,10 @@
+services:
+  dashboard:
+    build: .
+    ports:
+      - "8501:8501"
+    # Bind-mount data/ so alerts.jsonl, benchmark_results.json, and any
+    # freshly-generated demo stream persist on the host across container
+    # restarts and are inspectable without `docker cp`.
+    volumes:
+      - ./data:/app/data

@@ -26,6 +26,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from config import DATA_DIR, MODEL_DIR
 from src.pipeline.state_manager import IPStateManager
 from src.pipeline.engine import process_event, AlertDeduper
+from src.pipeline.event_schema import validate_event, InvalidEvent
 from src.features.reputation import PopularityAllowlist
 
 DEFAULT_INPUT = DATA_DIR / "demo_stream.jsonl"
@@ -36,15 +37,36 @@ TTL_SECONDS = 120
 
 
 def read_events(path):
+    """
+    Yields validated events, one per non-blank line. A malformed line
+    (corrupt JSON, missing/wrong-typed field) is reported to stderr with its
+    line number and reason and SKIPPED -- one bad record must not take down
+    the rest of the replay, which is exactly what happened before this
+    validation boundary existed (a raw KeyError/TypeError deep inside
+    state_manager.py would kill the whole process).
+    """
     fh = sys.stdin if path == "-" else open(path, encoding="utf-8")
+    n_rejected = 0
     try:
-        for line in fh:
+        for line_no, line in enumerate(fh, start=1):
             line = line.strip()
-            if line:
-                yield json.loads(line)
+            if not line:
+                continue
+            try:
+                raw = json.loads(line)
+                yield validate_event(raw)
+            except json.JSONDecodeError as e:
+                n_rejected += 1
+                print(f"[ingest] line {line_no}: invalid JSON ({e}) -- skipped",
+                      file=sys.stderr)
+            except InvalidEvent as e:
+                n_rejected += 1
+                print(f"[ingest] line {line_no}: {e} -- skipped", file=sys.stderr)
     finally:
         if fh is not sys.stdin:
             fh.close()
+        if n_rejected:
+            print(f"[ingest] {n_rejected} malformed event(s) rejected", file=sys.stderr)
 
 
 def main():

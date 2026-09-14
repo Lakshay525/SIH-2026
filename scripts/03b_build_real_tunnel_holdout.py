@@ -13,9 +13,13 @@ label 0=regular, 1=dns2tcp, 2=dnscapy, 3=iodine, 4=tuns.
 
 This dataset is per-query, not per-window, so we group same-label rows into
 synthetic "sessions" (shuffled, chunked) to approximate what one source IP's
-60-second window would look like, and compute the same five aggregate
+60-second window would look like, and compute the same seven aggregate
 features the model was trained on -- straight from the real query strings
-and real recorded qd_qtype, not assumed.
+and real recorded qd_qtype, not assumed (including non_a_ratio and
+record_type_entropy, both derived from the real qd_qtype field -- this is
+what first revealed non_a_ratio is 1.00 for every real tunnel tool here vs
+0.00 for real normal traffic, while txt_ratio alone is 0.0 for real
+iodine/tuns since they don't use TXT at all).
 
 Known, load-bearing limitation (see README "Limitations"): this dataset has
 no rcode/answer-outcome field usable as a real NXDOMAIN signal (the "regular"
@@ -24,7 +28,9 @@ a real NXDOMAIN pattern -- using it would mislabel 100% of benign sessions as
 all-NXDOMAIN). nxdomain_rate is therefore held at a neutral 0.0 for every
 real-derived session below; this eval does not exercise that feature.
 """
+import math
 import sys
+from collections import Counter
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -34,7 +40,9 @@ from config import DATA_DIR
 
 RAW_CSV = DATA_DIR / "real_tunnel_domains.csv"
 OUT_PATH = DATA_DIR / "real_tunnel_eval_windows.parquet"
-TXT_QTYPE = 16  # DNS TYPE 16 = TXT
+# Standard DNS TYPE values, as recorded in this dataset's qd_qtype column.
+A_QTYPE = 1
+TXT_QTYPE = 16
 
 TOOL_MAP = {0: "normal", 1: "dns2tcp", 2: "dnscapy", 3: "iodine", 4: "tuns"}
 # Real per-session query counts differ a lot by label (normal traffic is
@@ -42,6 +50,12 @@ TOOL_MAP = {0: "normal", 1: "dns2tcp", 2: "dnscapy", 3: "iodine", 4: "tuns"}
 # here) -- sized so each group yields a reasonable number of eval windows.
 SESSION_SIZE = {"normal": 12, "dns2tcp": 40, "dnscapy": 40, "iodine": 40, "tuns": 40}
 SEED = 42
+
+
+def record_type_entropy(qtypes: pd.Series) -> float:
+    counts = Counter(qtypes)
+    total = sum(counts.values())
+    return -sum((c / total) * math.log2(c / total) for c in counts.values() if c)
 
 
 def make_sessions(rows: pd.DataFrame, tool: str, session_size: int, rng) -> pd.DataFrame:
@@ -56,6 +70,8 @@ def make_sessions(rows: pd.DataFrame, tool: str, session_size: int, rng) -> pd.D
             "avg_query_len": chunk["qd_qname_len"].mean(),
             "txt_ratio": (chunk["qd_qtype"] == TXT_QTYPE).mean(),
             "nxdomain_rate": 0.0,  # see module docstring -- not derivable from this dataset
+            "non_a_ratio": (chunk["qd_qtype"] != A_QTYPE).mean(),
+            "record_type_entropy": record_type_entropy(chunk["qd_qtype"]),
             "label": "normal" if tool == "normal" else "tunnel",
             "tool": tool,
         })
@@ -80,7 +96,9 @@ def main():
     out = pd.concat(all_windows, ignore_index=True)
     out.to_parquet(OUT_PATH)
     print(f"\nSaved {len(out):,} real-derived holdout windows to {OUT_PATH}")
-    print(out.groupby(["label", "tool"])[["avg_query_len", "txt_ratio"]].mean())
+    print(out.groupby(["label", "tool"])[
+        ["avg_query_len", "txt_ratio", "non_a_ratio", "record_type_entropy"]
+    ].mean())
 
 
 if __name__ == "__main__":
