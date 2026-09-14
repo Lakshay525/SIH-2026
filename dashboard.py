@@ -45,13 +45,20 @@ def load_events():
         return [json.loads(line) for line in f if line.strip()]
 
 
-def run_replay(dga_model, tunnel_model):
+@st.cache_resource
+def load_allowlist():
+    from src.features.reputation import PopularityAllowlist
+    return PopularityAllowlist.from_umbrella_zip(DATA_DIR / "umbrella_top1m.csv.zip")
+
+
+def run_replay(dga_model, tunnel_model, allowlist=None):
     events = load_events()
     state_mgr = IPStateManager(max_ips=DEMO_MAX_IPS, ttl_seconds=120)
     deduper = AlertDeduper(cooldown_seconds=30.0)
     alerts = []
     for i, event in enumerate(events):
-        alerts.extend(process_event(event, dga_model, tunnel_model, state_mgr, deduper))
+        alerts.extend(process_event(event, dga_model, tunnel_model, state_mgr,
+                                     deduper, allowlist))
         if i % 200 == 0:
             state_mgr.expire(event["ts"])
     return events, alerts, state_mgr
@@ -61,8 +68,17 @@ dga_model, tunnel_model = load_models()
 
 col_a, col_b, col_c = st.columns(3)
 
+use_allowlist = st.checkbox(
+    "Suppress DGA alerts on globally-popular domains (Umbrella top-100k)",
+    value=False,
+    help="Reputation layer. Measured on this repo's dataset: covers 62.1% of benign "
+         "domains, wrongly suppresses 0 of 447,378 genuine DGA domains. Toggle it to "
+         "see the false-positive/recall trade directly.",
+)
+
 if st.button("▶ Replay demo stream", type="primary"):
-    events, alerts, state_mgr = run_replay(dga_model, tunnel_model)
+    allowlist = load_allowlist() if use_allowlist else None
+    events, alerts, state_mgr = run_replay(dga_model, tunnel_model, allowlist)
     st.session_state["events"] = events
     st.session_state["alerts"] = alerts
     st.session_state["active_ips"] = state_mgr.active_ips

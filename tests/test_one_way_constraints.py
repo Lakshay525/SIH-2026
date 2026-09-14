@@ -79,6 +79,22 @@ def test_full_pipeline_never_touches_network(no_network):
         process_event(event, dga_model, tunnel_model, state_mgr)  # must not raise
 
 
+def test_reputation_allowlist_never_touches_network(no_network):
+    """
+    The allowlist must resolve purely from the vendored Umbrella zip on disk.
+    A reputation lookup is the most natural place for someone to later add a
+    live API call or a PSL fetch -- this fails the moment that happens.
+    """
+    from config import DATA_DIR
+    from src.features.reputation import PopularityAllowlist
+
+    allowlist = PopularityAllowlist.from_umbrella_zip(
+        DATA_DIR / "umbrella_top1m.csv.zip", top_n=5000)
+    assert len(allowlist) > 0, "expected the vendored Umbrella list to load"
+    for domain in ["google.com", "bf65a853.duckdns.org", "lgveufiwmnxucyym.eu"]:
+        _ = domain in allowlist  # must not raise
+
+
 def test_pipeline_modules_do_not_import_networking_libraries():
     """
     Static complement to the runtime checks above: the modules that make up
@@ -87,9 +103,14 @@ def test_pipeline_modules_do_not_import_networking_libraries():
     to one of these files should fail this test, not slip through review.
     """
     banned_substrings = ("import socket", "import requests", "dns.resolver",
-                          "urllib.request", "http.client")
+                          "urllib.request", "http.client", "import tldextract")
     pipeline_files = [
         Path(__file__).resolve().parent.parent / "src" / "features" / "lexical.py",
+        # reputation.py is the one that could most plausibly regress into a
+        # live lookup -- a "reputation" layer is exactly the thing someone
+        # would be tempted to wire to a remote API or to `tldextract`, which
+        # fetches the Public Suffix List over the network on first use.
+        Path(__file__).resolve().parent.parent / "src" / "features" / "reputation.py",
         Path(__file__).resolve().parent.parent / "src" / "pipeline" / "state_manager.py",
         Path(__file__).resolve().parent.parent / "src" / "pipeline" / "engine.py",
         Path(__file__).resolve().parent.parent / "src" / "pipeline" / "alert_schema.py",

@@ -75,14 +75,63 @@ held-out-family results below). Both depend on a real wordlist: `data/english_wo
 `first20hours/google-10000-english`) — the code originally shipped with a 40-word placeholder
 fallback that starved both features of signal.
 
-**Label extraction fix:** the feature extractor originally took the *first* label of a domain
-(`domain.split(".")[0]`). DGArchive training domains are always bare `random.tld` (2 labels), so
-this was a no-op there — but real passively-observed FQDNs routinely carry a CDN/tracking
-subdomain as the leftmost label (e.g. `65873f45162247cb.threatcast.guardsquare.com`), which reads
-as high-entropy gibberish by pure chance and used to fire false CRITICAL alerts on ordinary
-Twitch/Akamai/CDN traffic in the streaming demo. `extract_label()` now takes the label just before
-the TLD instead — a heuristic (not full public-suffix-list-aware eTLD+1 extraction; multi-part
-TLDs like `co.uk` are a known edge case).
+**Which label gets judged — three bugs, in sequence.** This one feature-extraction decision turned
+out to be the single most consequential line in the DGA path, and it was wrong three different ways:
+
+1. **Originally the *first* label** (`domain.split(".")[0]`). DGArchive training domains are bare
+   `random.tld`, so this was a no-op in training — but real passively-observed FQDNs carry a
+   CDN/tracking subdomain as the leftmost label (`65873f45162247cb.threatcast.guardsquare.com`),
+   which reads as high-entropy gibberish by pure chance. It fired false CRITICAL alerts on ordinary
+   Akamai/Twitch/CDN traffic.
+2. **Fixing that with `parts[-2]` broke multi-part TLDs.** `infosys.co.in` was judged on the
+   constant `"co"`. `.co.in`/`.ac.in`/`.net.in` are squarely in this project's deployment context,
+   so this was a live failure, not a hypothetical.
+3. **It also silently broke every dynamic-DNS-based DGA family** — and this was the expensive one.
+   **9.25% of the DGA domains in this repo's own dataset (41,382 of 447,378)** are names like
+   `bf65a853.duckdns.org`, where `parts[-2]` is the *provider* (`duckdns`), not the
+   attacker-generated label. The classifier was being handed one of ~50 constant provider strings
+   for 41k malicious samples. Affected families include `grandoreiro`, `g01`, `recjs`, `symmi`,
+   `chaes`, `bamital`, `vidro`, `sutra` — and it lines up with the terrible per-family recalls
+   (`recjs` 0.152, `qhost` 0.089) seen before the fix.
+
+`extract_label()` now resolves the true registrable label against a bundled suffix list with two
+parts: country-style two-label suffixes (`co.uk`, `co.in`, …) and **PSL "private section"
+delegation points** — dynamic-DNS and free-hosting providers (`duckdns.org`, `ddns.net`,
+`hopto.org`, `github.io`, `pages.dev`, …) where the public registers subdomains, so the
+attacker-controlled label is one position further left. A generic-SLD-under-ccTLD heuristic
+(`co.ls`, `com.cy`, `ac.at`) covers the long tail; it's gated on a two-letter TLD so it can't
+misfire on real domains like `go.com`. After the fix, those 41,382 multi-label DGA domains resolve
+to **37,224 distinct labels instead of ~50 provider constants**.
+
+Deliberately a bundled static list rather than `tldextract`: **tldextract fetches the Public Suffix
+List over the network on first use**, which would violate the read-only/no-egress constraint this
+whole system rests on — `tests/test_one_way_constraints.py` fails it. Offline by construction beats
+convenient. The trade-off is manual updating and less-than-full-PSL coverage.
+
+### Reputation layer (`src/features/reputation.py`) — opt-in DGA false-positive suppression
+A purely lexical classifier cannot know that `wettringer-modellbauforum.de` is a real German hobby
+forum; it only sees consonant runs and a bad n-gram score. That's the source of the residual ~5.4%
+false-positive rate. The standard production mitigation is a **popularity allowlist**: a domain in
+the global top-N most-queried list is by construction not a freshly-registered algorithmic C2 name.
+
+`PopularityAllowlist` reads the Cisco Umbrella top-1M already vendored in `data/` (rank-ordered,
+straight from the zip — note `data/benign_domains.txt` is *unusable* for this, because
+`scripts/00` builds it through a `set()` and discards rank order). Top 100k lines → **15,658
+distinct registrable domains**.
+
+Measured trade, not asserted:
+
+| | measurement |
+|---|---|
+| Benign dataset domains covered (FP-suppression reach) | **62.1%** |
+| Genuine DGA domains wrongly suppressed (recall cost) | **0 of 447,378 (0.0000%)** |
+
+That recall cost was **1.61% (7,192 domains)** before the dynamic-DNS fix above — allowlisting
+matched on `duckdns.org` and would have whitelisted every dynamic-DNS C2 wholesale, handing
+attackers a one-line bypass. Matching on the true registrable identity
+(`bf65a853.duckdns.org`, not `duckdns.org`) closes it. This is a suppression layer, **off by
+default** and opt-in via `python scripts/07_stream_replay.py --allowlist`, so both numbers stay
+visible.
 
 ### Tunnelling detector (`src/pipeline/state_manager.py` + `src/models/tunnelling_detector.py`) — 5 window features
 `query_rate`, `unique_subdomains`, `avg_query_len`, `txt_ratio`, `nxdomain_rate`, computed per
@@ -101,9 +150,23 @@ Two independent, testable bounds — not one claim standing in for both:
    `stats(current_bucket_idx)` also treats any slot that has scrolled out of the window as zero at
    read time. (The original version never reset a slot at all, so a "60-second sliding window" was
    actually a lifetime cumulative counter for any long-running IP — harmless for a one-shot demo
-   burst, wrong for a real stream.) Unique-subdomain tracking promotes from an exact `set()` to a
-   HyperLogLog sketch (`datasketch`, p=8) once an IP exceeds 40 uniques, bounding memory for one
-   noisy IP too.
+   burst, wrong for a real stream.)
+
+   **All five features now decay, including `unique_subdomains`.** That one used to be a single
+   lifetime `set`/HyperLogLog that only ever grew, so even after the bucket-reset fix one of the
+   five features was still not windowed — a long-running IP's unique count could never come back
+   down, and the "60-second sliding window" claim was not fully true. Unique tracking is now
+   bucketed like everything else: each bucket keeps its own exact `set`, promoting to a
+   HyperLogLog only if that single 5-second bucket exceeds 40 uniques, and `stats()` unions the
+   live buckets. Locked down by `tests/test_sliding_window.py`.
+
+   Sketch sizing is measured, not guessed: `HLL_P=12` (4096 registers, ~4KB per *promoted* bucket)
+   gives ~1.2% error at 100 uniques, ~1.7% at 500, ~0.8% at 2000. The previous `p=8` was cheaper
+   (256B) but hit **10.6% error at 2000 uniques** and tripped datasketch's own accuracy warning.
+   Worst case is 12 × 4KB ≈ 48KB for a single IP, and only for IPs actually flooding >40 distinct
+   names per 5 seconds — i.e. the behaviour we're detecting. Note the honest corollary: a
+   pathological population of `max_ips` simultaneously-flooding sources would be
+   `max_ips × 48KB`, so `max_ips` is the knob that actually bounds worst-case memory.
 2. **`IPStateManager` (across many source IPs):** an `OrderedDict` LRU (`move_to_end` +
    `popitem(last=False)`, capped at `max_ips`) plus a TTL sweep (`expire(now_ts)`, driven by event
    timestamps, not wall-clock, so replays are reproducible) — bounds memory regardless of how many
@@ -112,6 +175,20 @@ Two independent, testable bounds — not one claim standing in for both:
 
 Proven, not just claimed, by `scripts/08_benchmark.py` (deliberately sets `max_ips` far below the
 number of distinct IPs generated) and exercised in `tests/test_one_way_constraints.py`.
+
+## Alert timestamps: observed time, not processing time
+
+`make_alert()` stamped every alert with `time.time()` — wall-clock *now* — and `engine.py` never
+passed the event's own `ts` through. So every alert from a replay was stamped with whenever this
+machine happened to process it. Replaying the same captured stream twice produced two different
+timelines, which quietly turns "when did the attack happen" into "when did the analyst run the
+tool" — directly contradicting the read-only/chain-of-custody property that is this system's whole
+reason for existing.
+
+`make_alert(..., observed_ts=event["ts"])` now carries capture time, falling back to wall-clock
+only when a caller genuinely has no observed timestamp.
+`tests/test_alert_timestamps.py` asserts the real property: **replaying the same capture twice
+produces identical timestamps**, and a 2020-era capture is never stamped with today's date.
 
 ## Two more bugs found by actually running the streaming replay end-to-end
 
@@ -171,15 +248,32 @@ fit on normal windows only (unsupervised), then scored against synthetic tunnel 
 `scripts/03b_build_real_tunnel_holdout.py` and scored by `scripts/04b_evaluate_tunnel_on_real.py`:
 
 - **100% recall on every real tunnel tool** in the dataset (dns2tcp, dnscapy, iodine, tuns).
-- **~9.6% specificity on the real "regular" holdout** (40/416 correctly passed, 376 flagged) — a
-  real, reported weakness, diagnosed rather than hidden: this dataset's "regular" class is a flat
-  list of distinct root domains (like a top-domain list), not a real host's repeated-visit session
-  log, so grouping it into fixed-size sessions manufactures artificially high `unique_subdomains`
-  per session — a construction artifact this specific public dataset can't avoid, not necessarily
-  evidence of the same false-positive rate against genuine single-host benign traffic. (This
-  started at ~6% before `avg_query_len`'s synthetic "normal" distribution was recalibrated to the
-  mean/stdev actually measured off `data/benign_domains.txt` — a real, if partial, improvement.)
-  See **Limitations**.
+- **~9.6% specificity on the real "regular" holdout** (40/416 passed, 376 flagged). Rather than
+  leave the explanation as an untested story, `scripts/04c_diagnose_real_specificity.py` runs an
+  ablation: hold the real data fixed and swap one feature at a time to its synthetic-normal
+  counterpart.
+
+  | ablation (one feature replaced, other four real) | false-positive rate |
+  |---|---|
+  | baseline (as built) | 90.4% |
+  | `query_rate` → synthetic median | **0.0%** |
+  | `unique_subdomains` → synthetic median | **0.0%** |
+  | `nxdomain_rate` → synthetic median | **0.0%** |
+  | `avg_query_len` → synthetic median | 100.0% |
+  | `txt_ratio` → synthetic median | 99.0% |
+  | `unique_subdomains` → realistic revisit rate, everything else real | **0.0%** |
+
+  The eval harness introduces **three** independent artifacts — fixed 12-query sessions, all-unique
+  domains (`unique_subdomains == query_rate`, which no real host produces), and a constant
+  `nxdomain_rate = 0.0` (the dataset has no rcode field, and an exact 0.0 is itself outside the
+  trained distribution). **Neutralising any one of them alone collapses the false-positive rate to
+  zero.** So the 9.6% figure is a property of how this public dataset has to be sessionised, not a
+  measurement of the detector against real host traffic.
+
+  **The honest corollary, stated plainly: this does not show the detector has good real-world
+  specificity — it shows the 9.6% number does not measure it.** Real-world specificity remains
+  unmeasured, and cannot be measured without real per-host session logs, which this dataset's flat
+  domain list cannot provide. See **Limitations**.
 - **Important, honest finding**: real iodine and tuns traffic in this dataset shows `txt_ratio =
   0.0` (they use NULL/CNAME records, not TXT) — directly contradicting the synthetic generator's
   assumption of TXT-heavy iodine traffic. The current 5-feature schema only tracks a TXT/non-TXT
@@ -239,10 +333,12 @@ python scripts/03_generate_tunnelling_dataset.py
 python scripts/04_train_tunnelling_detector.py
 python scripts/03b_build_real_tunnel_holdout.py     # needs data/real_tunnel_domains.csv
 python scripts/04b_evaluate_tunnel_on_real.py
+python scripts/04c_diagnose_real_specificity.py     # ablation behind the real-holdout FP rate
 
 # Streaming demo
 python scripts/06_generate_demo_stream.py           # builds data/demo_stream.jsonl
 python scripts/07_stream_replay.py                  # replays it, writes data/alerts.jsonl
+python scripts/07_stream_replay.py --allowlist      # same, with popularity suppression on
 
 # Throughput proof
 python scripts/08_benchmark.py
@@ -256,19 +352,22 @@ pytest tests/
 
 ## Limitations (stated honestly, not glossed over)
 
-- **`extract_label()`'s TLD heuristic** is not public-suffix-list-aware — multi-part TLDs
-  (`co.uk`, `com.au`, ...) will extract the wrong label. A real deployment should use `tldextract`
-  or an equivalent PSL-based library instead.
-- **`unique_subdomains` doesn't decay with the sliding window** the way the other four features
-  do — it's a lifetime set/HyperLogLog for the life of the `IPState` object, not bucketed per
-  60-second window. A very-long-running IP's unique count only ever grows.
+- **The bundled suffix list is not the full Public Suffix List.** It covers country-style
+  two-label suffixes, the dynamic-DNS/free-hosting providers actually present in this dataset, and
+  a generic-SLD-under-ccTLD heuristic for the long tail — but it is a static snapshot that needs
+  manual updating, and a suffix outside it will still mis-resolve. This is a deliberate trade:
+  `tldextract` would be more complete but fetches the PSL over the network, which the one-way
+  constraint forbids. A vendored PSL *snapshot file* (parsed offline) would be the better long-term
+  answer than a hand-maintained list.
+- **Real-world specificity of the tunnelling detector is unmeasured** (not "measured and bad", and
+  not "fine"). The 9.6% figure from the public holdout is an artifact of that dataset's
+  sessionisation, as the ablation in `scripts/04c` shows — but no dataset available here contains
+  real per-host DNS session logs, so the number that would actually matter in deployment has never
+  been measured. Closing this needs a real capture (e.g. the sibling `data-exfiltration` branch's
+  Zeek lab approach), not more analysis of this dataset.
 - **The tunnelling training data is still synthetic**, just protocol-realistic rather than
-  gaussian. The real-data holdout (above) validates recall against actual tunnel tool traffic, but
-  the ~6% real-holdout specificity shows the synthetic "normal" distribution and this specific
-  public dataset's "regular" class don't fully agree — and this dataset has no real per-host
-  session logs to check against instead. A genuine per-host benign traffic capture (e.g. the
-  sibling `data-exfiltration` branch's own Zeek lab approach) would be needed to close this
-  honestly.
+  gaussian. The real-data holdout validates *recall* against actual tunnel-tool traffic (100% on
+  all four tools), but no synthetic distribution is a substitute for a real capture.
 - **No real NXDOMAIN signal in the real-data holdout** — the public dataset has no rcode field
   usable for it (see `scripts/03b`'s docstring), so `nxdomain_rate` is held at 0.0 for all
   real-derived sessions and isn't actually exercised by that particular evaluation.
@@ -279,15 +378,18 @@ pytest tests/
   This is reported per-family by `scripts/02_train_dga_classifier.py`, not averaged away.
 - **This is one of six required threat detectors** — it has no view of DDoS, botnet C2, encrypted
   malware, port scanning, or exfiltration traffic, and doesn't attempt to fuse signal across them.
-- **The DGA classifier's ~5.4% false-positive rate (1 - 0.946 precision) is real and visible in the
-  demo replay**, not hidden: replaying `scripts/06`'s ~900 real benign domain lookups through
-  `scripts/07` raises roughly that many false DGA alerts on legitimate foreign-language/unusual
-  domains (e.g. German, Indonesian, Estonian sites). A purely lexical model has no reputation or
-  allowlist signal to fall back on — this is exactly why alerts carry a confidence score and
-  evidence for analyst triage rather than being wired to auto-block.
-- **Throughput is bottlenecked by per-event LightGBM inference** (~2.7ms of ~3ms per event) — see
-  "Measured throughput" above for the concrete number and the un-taken optimization (batching /
-  raw-numpy input) that would improve it.
+- **The DGA classifier's residual false-positive rate is real and visible in the demo replay**,
+  not hidden: replaying `scripts/06`'s real benign domain lookups raises false DGA alerts on
+  legitimate foreign-language/unusual domains (German, Indonesian, Estonian sites). The popularity
+  allowlist suppresses the majority of these at zero measured recall cost, but it is off by default
+  and covers ~62% of benign domains — the uncovered tail still false-positives. This is why alerts
+  carry a confidence score and supporting evidence for analyst triage rather than being wired to
+  auto-block.
+- **Throughput is adequate for a mirror-port enclave, not for a core peering link.** See "Measured
+  throughput": a single process sustains low-thousands of events/sec after the numpy/booster fix.
+  A busy gateway can produce far more DNS QPS than that, so real deployment would need the
+  micro-batching path (measured at ~0.004ms/row amortised, ~100× the per-event path) or horizontal
+  sharding by source IP. Neither is implemented — stated as a limit, not hand-waved as "scales".
 
 ## Project layout
 
@@ -304,17 +406,22 @@ scripts/
   03b_build_real_tunnel_holdout.py     real Mendeley dataset -> real_tunnel_eval_windows.parquet
   04_train_tunnelling_detector.py      train Isolation Forest -> tunnelling_isolation_forest.pkl
   04b_evaluate_tunnel_on_real.py       score the trained model against the real holdout
+  04c_diagnose_real_specificity.py     ablation: what actually drives the real-holdout FP rate
   05_live_demo.py                      minimal smoke test of both models
   06_generate_demo_stream.py           multi-IP timestamp-ordered event log -> demo_stream.jsonl
   07_stream_replay.py                  the actual streaming engine, JSONL in -> alerts.jsonl out
   08_benchmark.py                      measured throughput/latency + bounded-memory proof
 src/
-  features/lexical.py                  8 lexical features + extract_label()
+  features/lexical.py                  8 lexical features + extract_label() + suffix handling
+  features/reputation.py               popularity allowlist (opt-in FP suppression)
   models/dga_lightgbm.py               LightGBM wrapper + held_out_family_eval
-  models/tunnelling_detector.py        Isolation Forest wrapper
+  models/tunnelling_detector.py        Isolation Forest wrapper (numpy-consistent)
   pipeline/state_manager.py            IPState (per-IP) + IPStateManager (LRU/TTL across IPs)
-  pipeline/engine.py                   the one shared process_event() path
+  pipeline/engine.py                   the one shared process_event() path + AlertDeduper
   pipeline/alert_schema.py             make_alert() + severity mapping
 tests/
   test_one_way_constraints.py          mechanically enforces "never probes/resolves"
+  test_alert_timestamps.py             alerts carry capture time; replays are reproducible
+  test_sliding_window.py               all five features decay; bounded-memory promotion
+  test_label_extraction.py             CDN / multi-part TLD / dynamic-DNS label resolution
 ```

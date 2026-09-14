@@ -26,6 +26,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from config import DATA_DIR, MODEL_DIR
 from src.pipeline.state_manager import IPStateManager
 from src.pipeline.engine import process_event, AlertDeduper
+from src.features.reputation import PopularityAllowlist
 
 DEFAULT_INPUT = DATA_DIR / "demo_stream.jsonl"
 ALERTS_PATH = DATA_DIR / "alerts.jsonl"
@@ -52,12 +53,21 @@ def main():
                      help="JSONL event file, or '-' for stdin")
     ap.add_argument("--max-ips", type=int, default=MAX_IPS)
     ap.add_argument("--ttl-seconds", type=float, default=TTL_SECONDS)
+    ap.add_argument("--allowlist", action="store_true",
+                     help="suppress DGA alerts on globally-popular domains "
+                          "(Umbrella top-100k) -- trades a little recall for a "
+                          "lot of precision; run with and without to see both")
     args = ap.parse_args()
 
     dga_model = joblib.load(MODEL_DIR / "dga_lightgbm.pkl")
     tunnel_model = joblib.load(MODEL_DIR / "tunnelling_isolation_forest.pkl")
     state_mgr = IPStateManager(max_ips=args.max_ips, ttl_seconds=args.ttl_seconds)
     deduper = AlertDeduper(cooldown_seconds=30.0)
+
+    allowlist = None
+    if args.allowlist:
+        allowlist = PopularityAllowlist.from_umbrella_zip(DATA_DIR / "umbrella_top1m.csv.zip")
+        print(f"Popularity allowlist: {len(allowlist):,} registrable domains")
 
     ALERTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     n_events = 0
@@ -68,7 +78,8 @@ def main():
     with open(ALERTS_PATH, "w", encoding="utf-8") as alerts_out:
         for event in read_events(args.input):
             t0 = time.perf_counter()
-            alerts = process_event(event, dga_model, tunnel_model, state_mgr, deduper)
+            alerts = process_event(event, dga_model, tunnel_model, state_mgr,
+                                    deduper, allowlist)
             latencies_ms.append((time.perf_counter() - t0) * 1000)
 
             for alert in alerts:

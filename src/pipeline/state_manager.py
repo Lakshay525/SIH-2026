@@ -11,9 +11,13 @@ Two layers of bounding:
      of accumulating forever. (The original version never reset a slot, so a
      "60-second sliding window" was actually a lifetime cumulative counter --
      harmless for a single one-shot demo burst, but wrong for a real stream.)
-     Cheap set-based unique-subdomain tracking promotes to a HyperLogLog sketch
-     only for IPs that look suspicious (many unique subdomains), bounding
-     memory for one noisy IP too.
+     Unique-subdomain tracking is bucketed the same way, so it decays with the
+     window like every other feature (it used to be a single lifetime set that
+     only ever grew, making one of the five features quietly non-windowed).
+     Each bucket tracks its own uniques cheaply as a set and promotes to a
+     HyperLogLog sketch if that single 5-second bucket blows past
+     PROMOTE_THRESHOLD, bounding memory for one noisy IP too; stats() unions
+     the live buckets to get the window's unique count.
   2. IPStateManager: bounds the *number of tracked IPs* -- IPState alone only
      bounds memory per IP, not across however many source IPs a stream throws
      at it. An OrderedDict LRU (move-to-end + popitem(last=False), capped at
@@ -26,7 +30,15 @@ from datasketch import HyperLogLog
 
 N_BUCKETS = 12          # 12 x 5-second buckets = 60-second sliding window
 BUCKET_SECONDS = 5
-PROMOTE_THRESHOLD = 40  # unique-subdomain count above which we switch to a sketch
+PROMOTE_THRESHOLD = 40  # uniques within ONE bucket above which we switch to a sketch
+# HyperLogLog precision: 2^12 = 4096 registers (~4KB) per PROMOTED bucket.
+# Measured error over the range a 5s bucket realistically sees: ~1.2% @100
+# uniques, ~1.7% @500, ~0.8% @2000. p=8 was cheaper (256B) but hit 10.6%
+# error at 2000 uniques and tripped datasketch's own accuracy warning.
+# Worst-case memory is 12 buckets x 4KB = ~48KB for a single IP, and only for
+# IPs actually flooding >PROMOTE_THRESHOLD distinct names per 5s bucket --
+# see README "Bounded state" for the full max_ips x promoted-bucket math.
+HLL_P = 12
 
 
 def bucket_index(ts: float) -> int:
@@ -36,7 +48,7 @@ def bucket_index(ts: float) -> int:
 
 class IPState:
     __slots__ = ("bucket_count", "bucket_sumlen", "bucket_txt", "bucket_nxdomain",
-                 "bucket_epoch", "domain_set", "hll", "promoted")
+                 "bucket_epoch", "bucket_domains", "bucket_hll")
 
     def __init__(self):
         self.bucket_count = [0] * N_BUCKETS
@@ -44,9 +56,8 @@ class IPState:
         self.bucket_txt = [0] * N_BUCKETS
         self.bucket_nxdomain = [0] * N_BUCKETS
         self.bucket_epoch = [-1] * N_BUCKETS   # global bucket_idx last written to each slot
-        self.domain_set = set()
-        self.hll = None
-        self.promoted = False
+        self.bucket_domains = [set() for _ in range(N_BUCKETS)]
+        self.bucket_hll = [None] * N_BUCKETS   # set once a bucket is promoted
 
     def _slot(self, bucket_idx):
         b = bucket_idx % N_BUCKETS
@@ -55,6 +66,8 @@ class IPState:
             self.bucket_sumlen[b] = 0
             self.bucket_txt[b] = 0
             self.bucket_nxdomain[b] = 0
+            self.bucket_domains[b] = set()
+            self.bucket_hll[b] = None
             self.bucket_epoch[b] = bucket_idx
         return b
 
@@ -67,16 +80,18 @@ class IPState:
         if nxdomain:
             self.bucket_nxdomain[b] += 1
 
-        if not self.promoted:
-            self.domain_set.add(domain)
-            if len(self.domain_set) > PROMOTE_THRESHOLD:
-                self.hll = HyperLogLog(p=8)
-                for d in self.domain_set:
-                    self.hll.update(d.encode("utf8"))
-                self.domain_set = None
-                self.promoted = True
+        if self.bucket_hll[b] is not None:
+            self.bucket_hll[b].update(domain.encode("utf8"))
         else:
-            self.hll.update(domain.encode("utf8"))
+            self.bucket_domains[b].add(domain)
+            if len(self.bucket_domains[b]) > PROMOTE_THRESHOLD:
+                # This single 5s bucket is seeing a flood of distinct names --
+                # swap it for a fixed-size sketch so memory stays bounded.
+                hll = HyperLogLog(p=HLL_P)
+                for d in self.bucket_domains[b]:
+                    hll.update(d.encode("utf8"))
+                self.bucket_domains[b] = set()
+                self.bucket_hll[b] = hll
 
     def clear_bucket(self, bucket_idx):
         b = bucket_idx % N_BUCKETS
@@ -84,10 +99,35 @@ class IPState:
         self.bucket_sumlen[b] = 0
         self.bucket_txt[b] = 0
         self.bucket_nxdomain[b] = 0
+        self.bucket_domains[b] = set()
+        self.bucket_hll[b] = None
         self.bucket_epoch[b] = bucket_idx
 
-    def unique_estimate(self):
-        return self.hll.count() if self.promoted else len(self.domain_set)
+    def unique_estimate(self, live_buckets=None):
+        """
+        Distinct query names across the live buckets -- i.e. within the
+        sliding window, not for all time. Exact while every live bucket is
+        still a plain set (the overwhelmingly common case); approximate via a
+        HyperLogLog union once any bucket has been promoted under load.
+        """
+        if live_buckets is None:
+            live_buckets = range(N_BUCKETS)
+        live_buckets = list(live_buckets)
+
+        if not any(self.bucket_hll[b] is not None for b in live_buckets):
+            union = set()
+            for b in live_buckets:
+                union |= self.bucket_domains[b]
+            return len(union)
+
+        merged = HyperLogLog(p=HLL_P)
+        for b in live_buckets:
+            if self.bucket_hll[b] is not None:
+                merged.merge(self.bucket_hll[b])
+            else:
+                for d in self.bucket_domains[b]:
+                    merged.update(d.encode("utf8"))
+        return merged.count()
 
     def stats(self, current_bucket_idx=None):
         """
@@ -98,7 +138,7 @@ class IPState:
         original behaviour) to just sum whatever the buffer currently holds.
         """
         if current_bucket_idx is None:
-            live = range(N_BUCKETS)
+            live = list(range(N_BUCKETS))
         else:
             oldest_live_epoch = current_bucket_idx - N_BUCKETS + 1
             live = [b for b in range(N_BUCKETS) if self.bucket_epoch[b] >= oldest_live_epoch]
@@ -112,7 +152,7 @@ class IPState:
             "avg_query_len": sum_len / count if count else 0,
             "txt_ratio": txt / count if count else 0,
             "nxdomain_rate": nxdomain / count if count else 0,
-            "unique_subdomains": self.unique_estimate(),
+            "unique_subdomains": self.unique_estimate(live),
         }
 
 

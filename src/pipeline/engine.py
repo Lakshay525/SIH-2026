@@ -19,7 +19,7 @@ anything (see tests/test_one_way_constraints.py):
         "nxdomain": bool,   # whether the response (if observed) was NXDOMAIN
     }
 """
-import pandas as pd
+import numpy as np
 
 from src.features.lexical import lexical_features
 from src.models.dga_lightgbm import FEATURE_COLS as DGA_COLS
@@ -64,15 +64,29 @@ class AlertDeduper:
         return True
 
 
-def check_dga(dga_model, event: dict):
+def check_dga(dga_model, event: dict, allowlist=None):
     domain = event["domain"]
-    feats = pd.DataFrame([lexical_features(domain)])[DGA_COLS]
-    prob = _pyfloat(dga_model.predict_proba(feats)[0, 1])
+    # Reputation gate (opt-in). A domain in the global top-N most-queried list
+    # is not a freshly-generated C2 name; suppressing here is what keeps a
+    # purely lexical model's ~5% false-positive rate off the analyst's screen.
+    # Checked before inference so it also saves the model call.
+    if allowlist is not None and domain in allowlist:
+        return None
+    feats = lexical_features(domain)
+    # Hot path. Building a one-row pandas DataFrame and going through the
+    # sklearn wrapper's predict_proba cost ~4.3ms/event and was ~90% of total
+    # pipeline time; calling the underlying booster with a raw numpy row costs
+    # ~0.40ms for bit-identical output (verified: max abs diff 0.0). For a
+    # binary objective the booster returns P(class=1) directly, which is
+    # exactly predict_proba(...)[:, 1].
+    row = np.array([[feats[c] for c in DGA_COLS]], dtype=np.float64)
+    prob = _pyfloat(dga_model.booster_.predict(row)[0])
     if prob <= DGA_THRESHOLD:
         return None
-    evidence = {k: _pyfloat(v) for k, v in feats.iloc[0].to_dict().items()}
+    evidence = {k: _pyfloat(v) for k, v in feats.items()}
     evidence["src_ip"] = event.get("src_ip")
-    return make_alert(flow_id=domain, threat_class="DGA", confidence=prob, evidence=evidence)
+    return make_alert(flow_id=domain, threat_class="DGA", confidence=prob,
+                       evidence=evidence, observed_ts=event.get("ts"))
 
 
 def check_tunnelling(tunnel_model, state_mgr, event: dict):
@@ -82,24 +96,30 @@ def check_tunnelling(tunnel_model, state_mgr, event: dict):
     stats = state_mgr.get_stats(ip, current_ts=event["ts"])
     if stats["query_rate"] < MIN_QUERIES_FOR_TUNNEL_SCORING:
         return None
-    row = pd.DataFrame([stats])[TUNNEL_COLS]
-    score = _pyfloat(-tunnel_model.decision_function(row)[0])
-    flagged = tunnel_model.predict(row)[0] == -1
-    if not flagged:
+    row = np.array([[stats[c] for c in TUNNEL_COLS]], dtype=np.float64)
+    # decision_function and predict each walk the whole forest; predict is
+    # exactly sign(decision_function) for IsolationForest (verified over 2000
+    # samples, 0 disagreements), so derive the flag and walk the trees once.
+    decision = _pyfloat(tunnel_model.decision_function(row)[0])
+    score = -decision
+    if decision >= 0:   # not an outlier
         return None
     evidence = {k: _pyfloat(v) for k, v in stats.items()}
     return make_alert(flow_id=ip, threat_class="DNS_TUNNELLING",
-                       confidence=min(score, 1.0), evidence=evidence)
+                       confidence=min(score, 1.0), evidence=evidence,
+                       observed_ts=event.get("ts"))
 
 
-def process_event(event: dict, dga_model, tunnel_model, state_mgr, deduper=None) -> list:
+def process_event(event: dict, dga_model, tunnel_model, state_mgr, deduper=None,
+                   allowlist=None) -> list:
     """
     Run one observed DNS query through both detectors. Returns 0-2 alerts.
     Pass an AlertDeduper to collapse an ongoing incident's repeat firings into
-    one alert per cooldown window instead of one per event.
+    one alert per cooldown window instead of one per event, and a
+    PopularityAllowlist to suppress DGA alerts on globally-popular domains.
     """
     alerts = []
-    dga_alert = check_dga(dga_model, event)
+    dga_alert = check_dga(dga_model, event, allowlist)
     if dga_alert:
         alerts.append(dga_alert)
     tunnel_alert = check_tunnelling(tunnel_model, state_mgr, event)

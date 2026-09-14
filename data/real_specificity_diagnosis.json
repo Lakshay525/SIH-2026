@@ -1,0 +1,13 @@
+{
+  "n_benign_sessions": 416,
+  "baseline_fp_rate": 0.9038461538461539,
+  "per_feature_ablation_fp_rate": {
+    "query_rate": 0.0,
+    "unique_subdomains": 0.0,
+    "avg_query_len": 1.0,
+    "txt_ratio": 0.9903846153846154,
+    "nxdomain_rate": 0.0
+  },
+  "realistic_revisit_fp_rate": 0.0,
+  "verdict": "H1 supported: the false-positive rate is dominated by the sessionisation artifact, not by the detector."
+}
