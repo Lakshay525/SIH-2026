@@ -2,12 +2,12 @@
   "n_events": 50000,
   "n_distinct_ips": 2000,
   "max_ips_configured": 500,
-  "wall_seconds": 159.29803179999726,
-  "events_per_second": 313.87707327593523,
-  "latency_ms_mean": 3.1849951419956053,
-  "latency_ms_p50": 3.5545999999158084,
-  "latency_ms_p95": 3.9902999997138977,
-  "latency_ms_p99": 4.314400001021568,
+  "wall_seconds": 7.86827529999573,
+  "events_per_second": 6354.6327617727275,
+  "latency_ms_mean": 0.15688976600664317,
+  "latency_ms_p50": 0.16390000382671133,
+  "latency_ms_p95": 0.2057999954558909,
+  "latency_ms_p99": 0.2535999956307933,
   "active_ips_after_run": 500,
   "evicted_total": 49500
 }

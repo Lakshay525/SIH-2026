@@ -221,15 +221,38 @@ Two evaluations are reported, and only one of them should be trusted:
 | Metric | Value |
 |---|---|
 | Dataset | 137 real DGArchive families + real Tranco/Umbrella benign domains |
-| Random-split (optimistic, comparison only) | recall=0.920 precision=0.946 auc=0.983 |
-| **Average held-out-family recall** | **0.814** |
+| Random-split (optimistic, comparison only) | recall=0.907 precision=0.942 auc=0.979 |
+| **Average held-out-family recall** | **0.829** |
 
-That 0.814 is *after* the wordlist + label-extraction fixes above — before them it was 0.750. Both
-fixes measurably improved genuine cross-family generalization, not just cosmetic cleanup.
+That number moved through three retrains as real bugs were found and fixed, each measured rather
+than assumed:
 
-Per-family recall varies enormously (some families near-perfect, some — e.g. `suppobox`,
-`qsnatch` — near zero). That spread is expected and reported honestly rather than averaged away;
-see the script's full per-family printout.
+| Fix | Held-out recall |
+|---|---|
+| Baseline (40-word fallback dict, first-label extraction) | 0.750 |
+| + real wordlist, `extract_label()` = `parts[-2]` | 0.814 |
+| + multi-part-TLD/dynamic-DNS suffix handling (final) | **0.829** |
+
+The middle step is the interesting one: it improved the *average* while silently breaking 9.25% of
+DGA domains onto constant provider labels (`duckdns`, `ddns`, …) — the final fix repairs that
+specific damage and improves the average again. Random-split recall dropped slightly (0.920→0.907)
+alongside it, which is the expected, healthier outcome: the model can no longer pattern-match
+`duckdns.org`/`ddns.net` as DGA markers across ~41k samples and has to classify the actual label.
+
+Per-family recall varies enormously and **doesn't move uniformly with a fix** — reported honestly
+rather than smoothed into the average:
+
+| family | before final fix | after |
+|---|---|---|
+| `qhost` | 0.089 | **0.622** |
+| `recjs` | 0.152 | **0.064** (worse) |
+| `qsnatch` | 0.000 | 0.000 (unaffected) |
+
+`recjs` getting worse is a real result, not an error — a feature-extraction fix that helps the
+*aggregate* can still hurt an individual family whose domains happened to correlate with the old
+(wrong) signal. `qsnatch` at 0.000 throughout suggests its DGA is either dictionary-word-based or
+otherwise outside what these 8 lexical features can see at all — see the script's full per-family
+printout for the rest.
 
 ### Tunnelling detector
 Trained on a **protocol-realistic synthetic generator** (`scripts/03_generate_tunnelling_dataset.py`),
@@ -288,7 +311,7 @@ every event individually through the real pipeline (`process_event`), never esti
 
 | events/sec | mean latency | p95 latency | p99 latency |
 |---|---|---|---|
-| 332 | 3.02 ms | 3.57 ms | 3.89 ms |
+| **6,355** | **0.157 ms** | 0.206 ms | 0.254 ms |
 
 Measured over 50,000 synthetic events across 2,000 distinct source IPs, with `max_ips=500` (far
 below the 2,000 IPs generated) — `active_ips` stayed capped at exactly 500 and `evicted_total`
@@ -296,11 +319,20 @@ reached 49,500, confirming the LRU eviction actually fired under load, not just 
 Reproduce with `python scripts/08_benchmark.py`; the dashboard reads this same file rather than
 asserting a canned "throughput sustained" string.
 
-Bottleneck, stated plainly: `check_dga`'s per-event pandas `DataFrame` construction + LightGBM
-`predict_proba` call dominates cost (~2.7ms of the ~3ms) — `check_tunnelling` alone runs at
->100,000 events/sec. Batching multiple queries into one `predict_proba` call, or replacing the
-per-call `DataFrame` wrapper with a raw numpy row, would be the next real optimization; not done
-here so the benchmark reflects the code as actually shipped, not a hand-tuned hot path.
+**This is a ~19x improvement (332 → 6,355 events/sec) from one bottleneck fix, verified
+bit-identical.** Profiling found the entire cost was the sklearn wrapper: `predict_proba` on a
+fresh one-row pandas `DataFrame` built per event cost 4.303ms; calling the underlying booster
+directly on a raw numpy row costs 0.396ms — **max absolute difference 0.0** across the check
+(`predict_proba` is a thin wrapper over the booster's raw output for a binary objective, so this
+is not an approximation). Both models were switched: `check_dga` calls
+`dga_model.booster_.predict(row)` directly, and the tunnelling `IsolationForest` derives `predict`
+from `decision_function`'s sign (verified 0 disagreements over 2,000 samples) instead of walking
+the forest twice. `src/models/tunnelling_detector.py`'s `train`/`score` were also made
+numpy-consistent end-to-end, which incidentally silenced a recurring sklearn "X does not have
+valid feature names" warning that the mixed DataFrame/array usage was causing.
+
+Even at 6,355 events/sec, stated honestly: that's one process on one machine, adequate for a
+mirror-port enclave but not sized against a core peering link — see **Limitations**.
 
 ## Alert schema
 
@@ -386,10 +418,12 @@ pytest tests/
   carry a confidence score and supporting evidence for analyst triage rather than being wired to
   auto-block.
 - **Throughput is adequate for a mirror-port enclave, not for a core peering link.** See "Measured
-  throughput": a single process sustains low-thousands of events/sec after the numpy/booster fix.
-  A busy gateway can produce far more DNS QPS than that, so real deployment would need the
-  micro-batching path (measured at ~0.004ms/row amortised, ~100× the per-event path) or horizontal
-  sharding by source IP. Neither is implemented — stated as a limit, not hand-waved as "scales".
+  throughput": a single process sustains ~6,355 events/sec after the numpy/booster fix. A busy
+  gateway can produce far more DNS QPS than that, so real deployment would need either
+  micro-batching (measured separately at ~0.0043ms/row amortised for a 300-row
+  `booster_.predict` call — ~92x the current single-event path) or horizontal sharding by source
+  IP. Neither is implemented as a production path here — stated as a limit, not hand-waved as
+  "scales".
 
 ## Project layout
 
