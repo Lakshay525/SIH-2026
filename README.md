@@ -47,6 +47,26 @@ different and heavier claim than "read a capture file"; see "Real capture" below
 six-detector dashboard. This repo consumes and emits data at the boundary those would plug into
 (a JSONL event stream in, a standardized alert schema out).
 
+## Industry-readiness assessment
+
+Asked plainly: **this is a rigorously-validated prototype, not something to point at live
+enterprise traffic unattended.** Specifically, not because of hand-waving but because of what's
+actually measured above and below:
+
+| | Where this stands | What production would need |
+|---|---|---|
+| DGA false-positive rate | ~6.3% raw at the default threshold; **0% additional cost** from the reputation allowlist (now on by default) | The allowlist plus an explicit operating-point choice (below) closes most of the gap — an enterprise SOC still needs the confidence-tiered alerting this schema already gives, not auto-block on a raw 0.5 cutoff |
+| Tunnelling false-positive rate | **Real-world specificity was unmeasured** until this pass; a *realistic* reconstruction (below) now measures 99.5% — still not a genuine capture | A real per-host pcap (recipe + tooling already built, see "Real DNS packet ingestion") to close this for real |
+| Throughput | 8,652 events/sec single-event (full pipeline), 36,927/sec DGA-only batched (3.1x, not the ~92x an isolated booster measurement suggested) | Horizontal sharding by source IP for a core link; vectorized feature extraction to close more of the batching gap |
+| Calibration | `predict_proba` checked against a real holdout for the first time this pass — see "Threshold calibration" below | Re-validate calibration on a schedule as the model is retrained, not once |
+| Drift / retraining | None — models are static artifacts checked into git | A retraining cadence, a feedback loop from analyst-labeled false positives, and model versioning |
+| Encrypted DNS (DoH/DoT) | **Total blind spot** — this is plaintext-DNS-only by design (matches the PS's "DNS query names" framing), but a growing share of real traffic is DoH/DoT, which this can't see at all | Out of scope for this slice; would need TLS/QUIC metadata features (that's a different detector in the wider six-detector PS scope) |
+| Reproducibility | Pinned deps, CI, Docker (config-validated) | Same, plus a proper model registry instead of `.pkl` files in git |
+
+None of this is new information hidden elsewhere — it's the same measurements reported throughout
+this README, collected here to answer the "is it good enough" question directly instead of making
+the reader piece it together from eleven separate sections.
+
 ## Architecture
 
 ```
@@ -157,9 +177,10 @@ Measured trade, not asserted:
 That recall cost was **1.61% (7,192 domains)** before the dynamic-DNS fix above — allowlisting
 matched on `duckdns.org` and would have whitelisted every dynamic-DNS C2 wholesale, handing
 attackers a one-line bypass. Matching on the true registrable identity
-(`bf65a853.duckdns.org`, not `duckdns.org`) closes it. This is a suppression layer, **off by
-default** and opt-in via `python scripts/07_stream_replay.py --allowlist`, so both numbers stay
-visible.
+(`bf65a853.duckdns.org`, not `duckdns.org`) closes it. **On by default** (`scripts/07_stream_replay.py
+--no-allowlist` / the dashboard checkbox to disable) — given a measured zero recall cost, shipping
+this off by default would be the wrong call for a real deployment; both numbers stay directly
+comparable via the opt-out flag.
 
 ### Tunnelling detector (`src/pipeline/state_manager.py` + `src/models/tunnelling_detector.py`) — 7 window features
 `query_rate`, `unique_subdomains`, `avg_query_len`, `txt_ratio`, `nxdomain_rate`, `non_a_ratio`,
@@ -308,6 +329,49 @@ more-correct fix undoes that for every family. `qsnatch` at 0.000 throughout sug
 either dictionary-word-based or otherwise outside what these 8 lexical features can see at all —
 see the script's full per-family printout for the rest.
 
+### Threshold calibration
+Two questions a deployed model should be able to answer and previously couldn't: is
+`predict_proba` actually trustworthy as a probability, and what does each severity cutoff in
+`alert_schema.py` (0.30/0.60/0.85 — originally just round numbers) cost in real precision/recall?
+`calibration_report()` (`src/models/dga_lightgbm.py`), run automatically by `scripts/02` against a
+genuine 20% holdout, answers both — saved to `data/dga_calibration.json`:
+
+| severity | precision | recall at/above | domains flagged (of 100k test) |
+|---|---|---|---|
+| MEDIUM (≥0.30) | 0.880 | 0.947 | 96,338 |
+| HIGH (≥0.60) | 0.956 | 0.878 | 82,259 |
+| CRITICAL (≥0.85) | 0.984 | 0.799 | 72,652 |
+
+Precision rises monotonically with severity as intended (validated, not assumed) — **CRITICAL
+alone is close to a safe auto-action tier (98.4% precision); MEDIUM/HIGH need analyst review**,
+consistent with this system's design (confidence + evidence for triage, not auto-block).
+
+Operating-point menu (threshold needed for a target false-positive budget):
+
+| target FP rate | threshold | precision | recall |
+|---|---|---|---|
+| ≤10% | 0.359 | 0.900 | 0.935 |
+| ≤5% | 0.566 | 0.950 | 0.888 |
+| ≤2% | 0.804 | 0.980 | 0.818 |
+| ≤1% | 0.916 | 0.990 | 0.743 |
+| ≤0.5% | 0.959 | 0.995 | 0.638 |
+| ≤0.2% | 0.986 | 0.998 | 0.486 |
+| ≤0.1% | 0.993 | 0.999 | 0.372 |
+
+The Brier score (**0.0574**, 0=perfect) shows the model's confidence scores are reasonably
+well-calibrated, not just a ranking — a 10-bin reliability check (predicted-vs-actual positive
+rate per bin) tracked within a few percentage points across the whole range. (Computed on a random
+holdout, same optimism caveat as the "RANDOM SPLIT" number above — a held-out-family calibration
+check would be the more honest version of this, not done here due to the cost of retraining per
+family multiple times over.) Full table in `data/dga_calibration.json`.
+
+**The deployed model is now refit on 100% of the data** after these metrics are computed — a
+standard practice this repo didn't previously follow. Before this pass, the model actually shipped
+in `data/models/dga_lightgbm.pkl` was the 80%-trained split model used for evaluation, leaving 20%
+of available data unused in production for no benefit (the held-out metrics above describe that
+split model's generalization behaviour, which the full refit should closely track without being
+literally the same fitted model).
+
 ### Tunnelling detector
 Trained on a **protocol-realistic synthetic generator** (`scripts/03_generate_tunnelling_dataset.py`),
 not gaussian noise — each "tunnel" row models a specific real tool's known wire behaviour (iodine,
@@ -356,9 +420,24 @@ fit on normal windows only (unsupervised), then scored against synthetic tunnel 
 
   **The honest corollary, stated plainly: this does not show the detector has good real-world
   specificity — it shows the false-positive number this dataset produces does not measure it.**
-  Real-world specificity remains unmeasured, and cannot be measured without real per-host session
-  logs, which this dataset's flat domain list cannot provide. See "Real capture" and
-  **Limitations**.
+
+- **So the ablation's hypothesis was tested directly, not left asserted.** `scripts/03c` rebuilds
+  the benign holdout fixing exactly the one identified artifact — each synthetic session now
+  samples *with replacement* from a small (2-5 domain) personal "favourites" set per host, instead
+  of forcing every query to a distinct domain — while keeping every value that's genuinely real
+  (the domain strings, their lengths, their recorded query types). Scored by `scripts/04d`:
+
+  | | original (scripts/03b) construction | realistic (scripts/03c) construction |
+  |---|---|---|
+  | Specificity on real domain strings | 0% (0/416) | **99.5% (414/416)** |
+  | Recall on all 4 real tunnel tools | 100% | 100% (unchanged) |
+
+  This directly confirms the ablation's diagnosis with a concrete, favorable result: fixing the one
+  identified construction flaw, using real domain data throughout, recovers both near-perfect
+  specificity *and* full recall simultaneously. **Still not a genuine per-host capture** — the
+  *pattern* of repeat visits is simulated (2-5 favourites, sampled with replacement), not observed
+  — so this is better evidence than the original construction, not a substitute for "Real DNS
+  packet ingestion" below. Full numbers in `data/real_tunnel_eval_realistic_results.json`.
 - **Historical finding this drove**: real iodine and tuns traffic in this dataset showed
   `txt_ratio = 0.0` (they use NULL/CNAME records, not TXT), directly contradicting the original
   synthetic generator's assumption of TXT-heavy iodine traffic — the original 5-feature schema
@@ -406,7 +485,7 @@ every event individually through the real pipeline (`process_event`), never esti
 
 | events/sec | mean latency | p95 latency | p99 latency |
 |---|---|---|---|
-| **8,128** | **0.123 ms** | 0.164 ms | 0.210 ms |
+| **8,652** | **0.115 ms** | 0.134 ms | 0.197 ms |
 
 Measured over 50,000 synthetic events across 2,000 distinct source IPs, with `max_ips=500` (far
 below the 2,000 IPs generated) — `active_ips` stayed capped at exactly 500 and `evicted_total`
@@ -414,8 +493,9 @@ reached 49,500, confirming the LRU eviction actually fired under load, not just 
 Reproduce with `python scripts/08_benchmark.py`; the dashboard reads this same file rather than
 asserting a canned "throughput sustained" string.
 
-**This is a ~19x improvement (332 → 6,355 events/sec) from one bottleneck fix, verified
-bit-identical.** Profiling found the entire cost was the sklearn wrapper: `predict_proba` on a
+**This was originally a ~19x improvement (332 → 6,355 events/sec) from one bottleneck fix, verified
+bit-identical** (the current 8,652 reflects later retrains/model changes on top of that same fix —
+see below for the ongoing number). Profiling found the entire cost was the sklearn wrapper: `predict_proba` on a
 fresh one-row pandas `DataFrame` built per event cost 4.303ms; calling the underlying booster
 directly on a raw numpy row costs 0.396ms — **max absolute difference 0.0** across the check
 (`predict_proba` is a thin wrapper over the booster's raw output for a binary objective, so this
@@ -426,7 +506,7 @@ the forest twice. `src/models/tunnelling_detector.py`'s `train`/`score` were als
 numpy-consistent end-to-end, which incidentally silenced a recurring sklearn "X does not have
 valid feature names" warning that the mixed DataFrame/array usage was causing.
 
-Even at 8,128 events/sec, stated honestly: that's one process on one machine, adequate for a
+Even at 8,652 events/sec, stated honestly: that's one process on one machine, adequate for a
 mirror-port enclave but not sized against a core peering link — see **Limitations**.
 
 ## Alert schema
@@ -488,7 +568,7 @@ python scripts/04c_diagnose_real_specificity.py     # ablation behind the real-h
 # Streaming demo
 python scripts/06_generate_demo_stream.py           # builds data/demo_stream.jsonl
 python scripts/07_stream_replay.py                  # replays it, writes data/alerts.jsonl
-python scripts/07_stream_replay.py --allowlist      # same, with popularity suppression on
+python scripts/07_stream_replay.py --no-allowlist   # disable the (default-on) popularity allowlist
 
 # Real packet capture (see "Real DNS packet ingestion" above)
 python scripts/09_ingest_pcap.py my_session.pcap --out data/my_real_session.jsonl
@@ -521,13 +601,14 @@ pytest tests/
   dataset could introduce a provider neither source lists. `tests/test_public_suffix.py` at least
   pins today's known gaps so a future PSL update that fills one is caught (the test fails loudly,
   on purpose, telling you to remove the now-redundant entry).
-- **Real-world specificity of the tunnelling detector is unmeasured** (not "measured and bad", and
-  not "fine"). The 0% figure from the public holdout is an artifact of that dataset's
-  sessionisation, as the ablation in `scripts/04c` shows — but no dataset available here contains
-  real per-host DNS session logs, so the number that would actually matter in deployment has never
-  been measured. "Real DNS packet ingestion" above gives the exact recipe and the tooling
-  (`scripts/09_ingest_pcap.py`) to close this on a machine with real capture capability — not
-  done here because this environment has none.
+- **Real-world specificity of the tunnelling detector is best-evidenced, not definitively
+  measured.** `scripts/03c`/`04d`'s realistic reconstruction (99.5% specificity, real domain
+  strings, a simulated-but-plausible revisit pattern) is meaningfully stronger evidence than the
+  original 0%/artifact-laden construction, and directly confirms the ablation's diagnosis — but the
+  revisit *pattern* is still simulated, not observed, so this is not the same claim as a genuine
+  per-host capture. No dataset available here contains one. "Real DNS packet ingestion" above gives
+  the exact recipe and the tooling (`scripts/09_ingest_pcap.py`) to close this for real on a
+  machine with capture capability — not done here because this environment has none.
 - **The tunnelling training data is still synthetic**, just protocol-realistic and (for
   `non_a_ratio`/`record_type_entropy`) directly calibrated against real per-tool measurements
   rather than gaussian. The real-data holdout validates *recall* against actual tunnel-tool traffic
@@ -545,17 +626,22 @@ pytest tests/
 - **The DGA classifier's residual false-positive rate is real and visible in the demo replay**,
   not hidden: replaying `scripts/06`'s real benign domain lookups raises false DGA alerts on
   legitimate foreign-language/unusual domains (German, Indonesian, Estonian sites). The popularity
-  allowlist suppresses the majority of these at zero measured recall cost, but it is off by default
-  and covers ~59% of benign domains — the uncovered tail still false-positives. This is why alerts
+  allowlist (on by default now) suppresses the majority of these at zero measured recall cost, but
+  covers ~59% of benign domains — the uncovered tail still false-positives. This is why alerts
   carry a confidence score and supporting evidence for analyst triage rather than being wired to
   auto-block.
+- **Batching helps less than the isolated booster measurement suggested.** The booster call alone
+  batches ~92x (0.396ms/row single vs. ~0.0043ms/row for a 300-row call) — but `check_dga_batch`'s
+  *end-to-end* measured gain is **3.1x** (11,853 → 36,927 events/sec, `scripts/08_benchmark.py
+  --dga-batch-size`), because `lexical_features()` (pure-Python string/entropy/bigram work) isn't
+  vectorized and dominates once it's included. Reported as measured, not as the more flattering
+  isolated number. Vectorizing feature extraction across a batch would be the next real step
+  toward closing that gap — not done here.
 - **Throughput is adequate for a mirror-port enclave, not for a core peering link.** See "Measured
-  throughput": a single process sustains ~8,128 events/sec after the numpy/booster fix. A busy
-  gateway can produce far more DNS QPS than that, so real deployment would need either
-  micro-batching (measured separately at ~0.0043ms/row amortised for a 300-row
-  `booster_.predict` call — ~92x the current single-event path) or horizontal sharding by source
-  IP. Neither is implemented as a production path here — stated as a limit, not hand-waved as
-  "scales".
+  throughput": a single process sustains ~8,652 events/sec end-to-end (DGA+tunnelling combined),
+  36,927 events/sec for DGA-only batched scoring. A busy gateway can produce far more DNS QPS than
+  either, so real deployment would still need horizontal sharding by source IP on top of batching.
+  Not implemented as a production path here — stated as a limit, not hand-waved as "scales".
 - **The PCAP adapter reads a capture file already on disk, not a live interface** — see "Scope:
   what's built vs. not built" for why (no npcap/root here, and a live-socket reader would itself be
   an active network participant, a different claim than "parse a passive capture").

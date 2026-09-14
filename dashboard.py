@@ -82,10 +82,11 @@ col_a, col_b, col_c = st.columns(3)
 
 use_allowlist = st.checkbox(
     "Suppress DGA alerts on globally-popular domains (Umbrella top-100k)",
-    value=False,
-    help="Reputation layer. Measured on this repo's dataset: covers 62.1% of benign "
-         "domains, wrongly suppresses 0 of 447,378 genuine DGA domains. Toggle it to "
-         "see the false-positive/recall trade directly.",
+    value=True,
+    help="Reputation layer, ON by default. Measured on this repo's dataset: covers "
+         "58.96% of benign domains, wrongly suppresses 0 of 447,378 genuine DGA "
+         "domains -- a real production deployment should not ship this off. Untick "
+         "to see the raw, unsuppressed false-positive rate.",
 )
 
 if st.button("▶ Replay demo stream", type="primary"):

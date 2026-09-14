@@ -75,10 +75,11 @@ def main():
                      help="JSONL event file, or '-' for stdin")
     ap.add_argument("--max-ips", type=int, default=MAX_IPS)
     ap.add_argument("--ttl-seconds", type=float, default=TTL_SECONDS)
-    ap.add_argument("--allowlist", action="store_true",
-                     help="suppress DGA alerts on globally-popular domains "
-                          "(Umbrella top-100k) -- trades a little recall for a "
-                          "lot of precision; run with and without to see both")
+    ap.add_argument("--no-allowlist", action="store_true",
+                     help="disable the popularity allowlist (on by default: measured at "
+                          "0 of 447,378 genuine DGA domains wrongly suppressed, 58.96%% "
+                          "of benign traffic covered -- see README 'Reputation layer'). "
+                          "Pass this to see the raw, unsuppressed false-positive rate.")
     args = ap.parse_args()
 
     dga_model = joblib.load(MODEL_DIR / "dga_lightgbm.pkl")
@@ -87,9 +88,10 @@ def main():
     deduper = AlertDeduper(cooldown_seconds=30.0)
 
     allowlist = None
-    if args.allowlist:
+    if not args.no_allowlist:
         allowlist = PopularityAllowlist.from_umbrella_zip(DATA_DIR / "umbrella_top1m.csv.zip")
-        print(f"Popularity allowlist: {len(allowlist):,} registrable domains")
+        print(f"Popularity allowlist: {len(allowlist):,} registrable domains (on by default; "
+              f"pass --no-allowlist to disable)")
 
     ALERTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     n_events = 0

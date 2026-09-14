@@ -20,7 +20,7 @@ import joblib
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from config import DATA_DIR, MODEL_DIR
 from src.pipeline.state_manager import IPStateManager
-from src.pipeline.engine import process_event
+from src.pipeline.engine import process_event, check_dga, check_dga_batch
 
 OUT_PATH = DATA_DIR / "benchmark_results.json"
 
@@ -53,6 +53,9 @@ def main():
     ap.add_argument("--n-ips", type=int, default=2_000, help="distinct source IPs")
     ap.add_argument("--max-ips", type=int, default=500,
                      help="deliberately << n-ips, to force eviction and prove it bounds memory")
+    ap.add_argument("--dga-batch-size", type=int, default=500,
+                     help="also benchmark the batched DGA scoring path at this batch size -- "
+                          "the throughput a real micro-batching collector would actually see")
     args = ap.parse_args()
 
     dga_model = joblib.load(MODEL_DIR / "dga_lightgbm.pkl")
@@ -94,6 +97,36 @@ def main():
     print(f"  IPStateManager stayed bounded: active_ips={results['active_ips_after_run']} "
           f"(<= max_ips={args.max_ips}) despite {args.n_ips:,} distinct IPs seen, "
           f"evicted_total={results['evicted_total']:,}")
+
+    # The micro-batching path: what a real DNS collector buffering ~100ms
+    # worth of queries at a time would actually see. Compared against a
+    # DGA-ONLY single-event baseline (not the mixed DGA+tunnelling number
+    # above, which would be an apples-to-oranges comparison since that
+    # baseline also pays for state_mgr bookkeeping the batched path skips).
+    n_batches = args.n // args.dga_batch_size
+    if n_batches:
+        batches = [events[i*args.dga_batch_size:(i+1)*args.dga_batch_size] for i in range(n_batches)]
+        batch_events = n_batches * args.dga_batch_size
+
+        t0 = time.perf_counter()
+        for event in events[:batch_events]:
+            check_dga(dga_model, event)
+        dga_single_elapsed = time.perf_counter() - t0
+        dga_single_rate = batch_events / dga_single_elapsed
+
+        t0 = time.perf_counter()
+        for batch in batches:
+            check_dga_batch(dga_model, batch)
+        batch_elapsed = time.perf_counter() - t0
+        batch_rate = batch_events / batch_elapsed
+
+        results["dga_batch_size"] = args.dga_batch_size
+        results["dga_only_single_event_per_second"] = dga_single_rate
+        results["dga_batched_events_per_second"] = batch_rate
+        print(f"\nDGA-only comparison (batch_size={args.dga_batch_size}, same {batch_events:,} events "
+              f"both ways):")
+        print(f"  single-event: {dga_single_rate:,.0f} events/sec")
+        print(f"  batched:      {batch_rate:,.0f} events/sec  ({batch_rate/dga_single_rate:.1f}x)")
 
     OUT_PATH.write_text(json.dumps(results, indent=2))
     print(f"\nSaved results to {OUT_PATH}")

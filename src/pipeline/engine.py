@@ -22,7 +22,7 @@ anything (see tests/test_one_way_constraints.py):
 import numpy as np
 
 from src.features.lexical import lexical_features
-from src.models.dga_lightgbm import FEATURE_COLS as DGA_COLS
+from src.models.dga_lightgbm import FEATURE_COLS as DGA_COLS, predict_batch
 from src.models.tunnelling_detector import FEATURE_COLS as TUNNEL_COLS
 from src.pipeline.alert_schema import make_alert
 
@@ -87,6 +87,42 @@ def check_dga(dga_model, event: dict, allowlist=None):
     evidence["src_ip"] = event.get("src_ip")
     return make_alert(flow_id=domain, threat_class="DGA", confidence=prob,
                        evidence=evidence, observed_ts=event.get("ts"))
+
+
+def check_dga_batch(dga_model, events: list, allowlist=None) -> list:
+    """
+    The real production throughput path for the DGA side: score a batch of
+    events (e.g. a micro-batch a real DNS collector buffered over ~100ms)
+    in one booster call instead of one per event. Measured: ~0.004ms/row
+    amortised for a 300-row batch vs. ~0.40ms/row one at a time (~100x) --
+    see predict_batch()'s docstring. Returns a list the same length as
+    `events`, with None for events that didn't fire (allowlisted, or below
+    threshold) so callers can zip() it back against the input.
+    """
+    to_score = []       # (index into events, domain, feats)
+    alerts = [None] * len(events)
+    for i, event in enumerate(events):
+        domain = event["domain"]
+        if allowlist is not None and domain in allowlist:
+            continue
+        to_score.append((i, domain, lexical_features(domain)))
+
+    if not to_score:
+        return alerts
+
+    matrix = np.array([[feats[c] for c in DGA_COLS] for _, _, feats in to_score],
+                       dtype=np.float64)
+    probs = predict_batch(dga_model, matrix)
+
+    for (i, domain, feats), prob in zip(to_score, probs):
+        prob = _pyfloat(prob)
+        if prob <= DGA_THRESHOLD:
+            continue
+        evidence = {k: _pyfloat(v) for k, v in feats.items()}
+        evidence["src_ip"] = events[i].get("src_ip")
+        alerts[i] = make_alert(flow_id=domain, threat_class="DGA", confidence=prob,
+                                evidence=evidence, observed_ts=events[i].get("ts"))
+    return alerts
 
 
 def check_tunnelling(tunnel_model, state_mgr, event: dict):
